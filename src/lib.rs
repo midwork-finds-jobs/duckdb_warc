@@ -78,8 +78,7 @@ fn sanitize_for_ffi(s: &str) -> String {
 
 /// Parse HTTP response from WARC body
 /// Returns (http_version, http_status, http_headers_json, http_body_bytes)
-/// If skip_body is true, returns None for body (used for binary content)
-fn parse_http_response(body: &[u8], skip_body: bool) -> (Option<String>, Option<i32>, Option<String>, Option<Vec<u8>>) {
+fn parse_http_response(body: &[u8]) -> (Option<String>, Option<i32>, Option<String>, Option<Vec<u8>>) {
     // Quick check: if body doesn't start with HTTP, return None
     if !body.starts_with(b"HTTP/") {
         return (None, None, None, None);
@@ -130,12 +129,8 @@ fn parse_http_response(body: &[u8], skip_body: bool) -> (Option<String>, Option<
         Some(format!("{{{}}}", header_pairs.join(", ")))
     };
 
-    // Return body only if not skipping and body exists
-    let http_body = if skip_body {
-        None
-    } else {
-        body_bytes.map(|b| b.to_vec())
-    };
+    // Always return body as BLOB (handles binary content like PDFs)
+    let http_body = body_bytes.map(|b| b.to_vec());
 
     (http_version, http_status, http_headers, http_body)
 }
@@ -163,17 +158,7 @@ fn parse_warc_record(data: &[u8]) -> Option<ParsedRecord> {
 
     if warc_type == "response" {
         let body = record.body();
-
-        // Check if body contains null bytes (binary content)
-        // Parse HTTP headers but skip binary body
-        let is_binary = body.contains(&0u8);
-        if is_binary {
-            let uri = record.header(WarcHeader::TargetURI).unwrap_or_default();
-            let payload_type = record.header(WarcHeader::IdentifiedPayloadType).unwrap_or_default();
-            eprintln!("parse_warc: binary content, omitting body uri={} type={}", uri, payload_type);
-        }
-
-        let (http_version, http_status, http_headers, http_body) = parse_http_response(body, is_binary);
+        let (http_version, http_status, http_headers, http_body) = parse_http_response(body);
 
         Some(ParsedRecord {
             warc_version,
@@ -387,7 +372,7 @@ mod tests {
     #[test]
     fn test_parse_http_response_basic() {
         let http_data = b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nNot found";
-        let (version, status, headers, body) = parse_http_response(http_data, false);
+        let (version, status, headers, body) = parse_http_response(http_data);
 
         assert_eq!(version, Some("HTTP/1.1".to_string()));
         assert_eq!(status, Some(404));
@@ -396,20 +381,36 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_http_response_skip_body() {
+    fn test_parse_http_response_binary() {
+        // Binary content (PNG header) should be preserved in BLOB
         let http_data = b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\r\n\x89PNG\r\n\x1a\n";
-        let (version, status, headers, body) = parse_http_response(http_data, true);
+        let (version, status, headers, body) = parse_http_response(http_data);
 
         assert_eq!(version, Some("HTTP/1.1".to_string()));
         assert_eq!(status, Some(200));
         assert!(headers.is_some());
-        assert!(body.is_none()); // Body skipped
+        // Binary body is now preserved (not skipped)
+        assert_eq!(body, Some(b"\x89PNG\r\n\x1a\n".to_vec()));
+    }
+
+    #[test]
+    fn test_parse_http_response_pdf() {
+        // PDF content should be preserved in BLOB
+        let http_data = b"HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\n\r\n%PDF-1.4\n%\xe2\xe3\xcf\xd3";
+        let (version, status, headers, body) = parse_http_response(http_data);
+
+        assert_eq!(version, Some("HTTP/1.1".to_string()));
+        assert_eq!(status, Some(200));
+        assert!(headers.unwrap().contains("\"content-type\": \"application/pdf\""));
+        // PDF body preserved with binary data
+        assert!(body.is_some());
+        assert!(body.unwrap().starts_with(b"%PDF-1.4"));
     }
 
     #[test]
     fn test_parse_http_response_not_http() {
         let data = b"Not HTTP data";
-        let (version, status, headers, body) = parse_http_response(data, false);
+        let (version, status, headers, body) = parse_http_response(data);
 
         assert!(version.is_none());
         assert!(status.is_none());
