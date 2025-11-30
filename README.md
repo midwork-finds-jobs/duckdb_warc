@@ -1,173 +1,130 @@
 # DuckDB WARC Extension
 
-A DuckDB extension for reading WARC (Web ARChive) files, including compressed `.warc.gz` files commonly used by Common Crawl.
+A DuckDB extension for parsing WARC (Web ARChive) records. Designed for use with Common Crawl's columnar index for efficient selective record fetching.
 
 ## Features
 
-- Read WARC and WARC.gz files
-- Support for concatenated gzip format (used by Common Crawl)
-- Extract metadata and content from WARC records
-- SQL-based querying of web archive data
+- `parse_warc(BLOB|VARCHAR)` scalar function to parse WARC records
+- Returns structured data: WARC headers, HTTP headers, and body
+- Auto-detects gzip compression
+- Works with Common Crawl byte-range fetching workflow
+
+## Installation
+
+```sql
+-- Load the extension
+LOAD './build/release/extension/warc/warc.duckdb_extension';
+```
 
 ## Building
 
 ```bash
 make configure
-make debug    # or make release
+make release
 ```
 
 ## Usage
 
-### Loading the Extension
+### parse_warc() Function
 
+Parses a WARC record and returns a struct with:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `warc_version` | VARCHAR | WARC format version (e.g., "1.0") |
+| `warc_headers` | VARCHAR | JSON object of WARC headers |
+| `http_version` | VARCHAR | HTTP version (e.g., "HTTP/1.1") |
+| `http_status` | INTEGER | HTTP status code (e.g., 200) |
+| `http_headers` | VARCHAR | JSON object of HTTP headers |
+| `http_body` | BLOB | Response body content (binary) |
+
+### Examples
+
+**Parse a local WARC file:**
 ```sql
-LOAD './build/release/extension/warc/warc.duckdb_extension';
+SELECT parse_warc(content) FROM read_blob('record.warc.gz');
 ```
 
-### Reading WARC Files
-
-The extension provides a `read_warc()` table function that returns the following columns:
-
-- `warc_record_id` (VARCHAR) - Unique record identifier
-- `warc_type` (VARCHAR) - Record type (request, response, metadata, warcinfo)
-- `warc_date` (VARCHAR) - Timestamp of the record
-- `target_uri` (VARCHAR) - Target URI (for request/response records)
-- `content_length` (UBIGINT) - Length of the content
-- `content_type` (VARCHAR) - Content type header
-- `content` (BLOB) - Raw content data
-
-### Quick Start Examples
-
-For complete examples, see:
-- `examples/create_table.sh` - Creating persistent tables for fast querying
-- `examples/analyze_commoncrawl.sql` - Common Crawl analysis queries
-
-#### Count records in a WARC file
-
+**Parse uncompressed WARC from text:**
 ```sql
-SELECT COUNT(*) as record_count
-FROM read_warc('./test-data/sample.warc.gz');
+SELECT parse_warc(content) FROM read_text('record.warc');
 ```
 
-#### Group by record type
-
-```sql
-SELECT warc_type, COUNT(*) as count
-FROM read_warc('./test-data/sample.warc.gz')
-GROUP BY warc_type
-ORDER BY count DESC;
-```
-
-#### Query response records
-
+**Extract specific fields:**
 ```sql
 SELECT
-    warc_type,
-    warc_date,
-    target_uri,
-    content_length,
-    octet_length(content) as actual_content_length
-FROM read_warc('./test-data/sample.warc.gz')
-WHERE warc_type = 'response'
-LIMIT 5;
+    (parse_warc(content)).http_status,
+    (parse_warc(content)).http_body
+FROM read_blob('record.warc.gz');
 ```
 
-#### Extract text content from responses
+### Common Crawl Workflow
+
+The recommended workflow for Common Crawl is:
+
+1. **Query the columnar index** (Parquet) to find records
+2. **Fetch only the specific byte ranges** you need
+3. **Parse with this extension**
 
 ```sql
+-- Step 1: Query Common Crawl index to find a URL
+-- (Use their Parquet index at s3://commoncrawl/cc-index/...)
+
+-- Step 2: Download specific byte range
+-- curl -r OFFSET-END https://data.commoncrawl.org/FILENAME > record.warc.gz
+
+-- Step 3: Parse the record
 SELECT
-    target_uri,
-    content_type,
-    CAST(content AS VARCHAR) as text_content
-FROM read_warc('./test-data/sample.warc.gz')
-WHERE warc_type = 'response'
-  AND content_type LIKE '%text/html%'
-LIMIT 10;
+    (parse_warc(content)).http_status,
+    (parse_warc(content)).http_body
+FROM read_blob('record.warc.gz');
 ```
 
-### Using with Common Crawl
-
-To use with Common Crawl data, you can either:
-
-1. **Download the file first:**
+**Example: Fetch example.com from Common Crawl**
 ```bash
-wget https://data.commoncrawl.org/crawl-data/CC-MAIN-2025-43/segments/1759648358356.7/warc/CC-MAIN-20251009035013-20251009065013-00795.warc.gz
+# Download only 945 bytes instead of 1.1GB WARC file
+curl -s -r"46376769-46377713" \
+  "https://data.commoncrawl.org/crawl-data/CC-MAIN-2025-47/segments/1762439342185.16/warc/CC-MAIN-20251106200718-20251106230718-00970.warc.gz" \
+  > record.warc.gz
 ```
 
-Then query it:
 ```sql
-SELECT * FROM read_warc('./CC-MAIN-20251009035013-20251009065013-00795.warc.gz') LIMIT 10;
+SELECT
+    (parse_warc(content)).warc_version,
+    (parse_warc(content)).http_status,
+    (parse_warc(content)).http_body
+FROM read_blob('record.warc.gz');
 ```
 
-2. **Use httpfs extension (for streaming):**
-```sql
--- Note: Direct HTTP support is not yet implemented in the WARC extension
--- You'll need to download files locally first
+Output:
+```
+┌──────────────┬─────────────┬─────────────────────────────────────────────────┐
+│ warc_version │ http_status │ http_body                                       │
+├──────────────┼─────────────┼─────────────────────────────────────────────────┤
+│ 1.0          │ 200         │ <!doctype html><html lang="en"><head><title>... │
+└──────────────┴─────────────┴─────────────────────────────────────────────────┘
 ```
 
 ## Schema
 
-```
-┌─────────────────┬──────────┬─────────┐
-│  Column Name    │   Type   │ Nullable│
-├─────────────────┼──────────┼─────────┤
-│ warc_record_id  │ VARCHAR  │   No    │
-│ warc_type       │ VARCHAR  │   No    │
-│ warc_date       │ VARCHAR  │   No    │
-│ target_uri      │ VARCHAR  │   Yes   │
-│ content_length  │ UBIGINT  │   No    │
-│ content_type    │ VARCHAR  │   Yes   │
-│ content         │ BLOB     │   No    │
-└─────────────────┴──────────┴─────────┘
-```
-
-## Performance Characteristics
-
-**Important:** The current implementation loads all WARC records into memory during the initial query phase.
-
-**Quick Summary:**
-- First query: ~13 seconds (1.1GB file, 78k records) - regardless of LIMIT
-- Subsequent queries: instant (data cached in memory)
-- **Recommended:** Create persistent table for 1,300x faster queries!
-
-**Best Practice:**
 ```sql
--- One-time load (13-30 seconds)
-CREATE TABLE warc_data AS SELECT * FROM read_warc('file.warc.gz');
-
--- All subsequent queries (0.02 seconds)
-SELECT * FROM warc_data WHERE warc_type = 'response' LIMIT 10;
+parse_warc(BLOB) -> STRUCT(
+    warc_version VARCHAR,
+    warc_headers VARCHAR,    -- JSON: {"WARC-Type": "response", "WARC-Date": "...", ...}
+    http_version VARCHAR,
+    http_status INTEGER,
+    http_headers VARCHAR,    -- JSON: {"content-type": "text/html", ...}
+    http_body BLOB           -- Binary body (use decode(http_body) for text)
+)
 ```
-
-**When to use this extension:**
-- ✅ Exploratory analysis with multiple queries
-- ✅ Files with up to a few hundred thousand records
-- ✅ Creating persistent DuckDB tables from WARC data
-- ❌ Streaming massive files (10GB+)
-- ❌ One-off queries on large files
-
-See **[PERFORMANCE.md](PERFORMANCE.md)** for detailed analysis, benchmarks, and future improvement options.
 
 ## Technical Details
 
 - Built with Rust using the `warc` crate (v0.4.0)
-- Supports both compressed (.warc.gz) and uncompressed (.warc) files
-- Uses `MultiGzDecoder` to handle concatenated gzip format (used by Common Crawl)
+- Uses `flate2` for gzip decompression
+- Auto-detects compressed vs uncompressed input
 - Compatible with DuckDB v1.4.2
-- Records are loaded eagerly during query initialization and stored in memory
-
-## Example Output
-
-```
-┌───────────┬─────────────────────────┬───────────────────────────────────┬────────────────┐
-│ warc_type │        warc_date        │            target_uri             │ content_length │
-├───────────┼─────────────────────────┼───────────────────────────────────┼────────────────┤
-│ response  │ 2025-10-09 04:22:18 UTC │ http://021ka.com/gupiaogo...      │          21529 │
-│ response  │ 2025-10-09 05:13:35 UTC │ http://0u0.cn/?id=130             │          27056 │
-│ response  │ 2025-10-09 04:48:14 UTC │ http://0u0.cn/?id=581             │          25239 │
-└───────────┴─────────────────────────┴───────────────────────────────────┴────────────────┘
-```
 
 ## License
 
-This extension is built using the DuckDB Rust extension template and follows the DuckDB ecosystem licensing practices.
+MIT

@@ -24,7 +24,12 @@ struct ParsedRecord {
     http_version: Option<String>,
     http_status: Option<i32>,
     http_headers: Option<String>, // JSON map
-    http_body: Option<String>,
+    http_body: Option<Vec<u8>>,   // Binary body data
+}
+
+/// Sanitize header value for JSON output (escape quotes, remove null bytes)
+fn sanitize_header(v: &std::borrow::Cow<str>) -> String {
+    v.replace('"', "\\\"").replace('\0', "")
 }
 
 /// Convert WARC headers to a JSON-like map string
@@ -33,69 +38,88 @@ fn headers_to_json(record: &warc::Record<warc::BufferedBody>) -> String {
 
     // Get standard headers
     if let Some(v) = record.header(WarcHeader::WarcType) {
-        pairs.push(format!("\"WARC-Type\": \"{}\"", v.replace('"', "\\\"")));
+        pairs.push(format!("\"WARC-Type\": \"{}\"", sanitize_header(&v)));
     }
     if let Some(v) = record.header(WarcHeader::Date) {
-        pairs.push(format!("\"WARC-Date\": \"{}\"", v.replace('"', "\\\"")));
+        pairs.push(format!("\"WARC-Date\": \"{}\"", sanitize_header(&v)));
     }
     if let Some(v) = record.header(WarcHeader::RecordID) {
-        pairs.push(format!("\"WARC-Record-ID\": \"{}\"", v.replace('"', "\\\"")));
+        pairs.push(format!("\"WARC-Record-ID\": \"{}\"", sanitize_header(&v)));
     }
     if let Some(v) = record.header(WarcHeader::TargetURI) {
-        pairs.push(format!("\"WARC-Target-URI\": \"{}\"", v.replace('"', "\\\"")));
+        pairs.push(format!("\"WARC-Target-URI\": \"{}\"", sanitize_header(&v)));
     }
     if let Some(v) = record.header(WarcHeader::IPAddress) {
-        pairs.push(format!("\"WARC-IP-Address\": \"{}\"", v.replace('"', "\\\"")));
+        pairs.push(format!("\"WARC-IP-Address\": \"{}\"", sanitize_header(&v)));
     }
     if let Some(v) = record.header(WarcHeader::ContentType) {
-        pairs.push(format!("\"Content-Type\": \"{}\"", v.replace('"', "\\\"")));
+        pairs.push(format!("\"Content-Type\": \"{}\"", sanitize_header(&v)));
     }
     pairs.push(format!("\"Content-Length\": {}", record.content_length()));
     if let Some(v) = record.header(WarcHeader::PayloadDigest) {
-        pairs.push(format!("\"WARC-Payload-Digest\": \"{}\"", v.replace('"', "\\\"")));
+        pairs.push(format!("\"WARC-Payload-Digest\": \"{}\"", sanitize_header(&v)));
     }
     if let Some(v) = record.header(WarcHeader::BlockDigest) {
-        pairs.push(format!("\"WARC-Block-Digest\": \"{}\"", v.replace('"', "\\\"")));
+        pairs.push(format!("\"WARC-Block-Digest\": \"{}\"", sanitize_header(&v)));
     }
     if let Some(v) = record.header(WarcHeader::IdentifiedPayloadType) {
-        pairs.push(format!("\"WARC-Identified-Payload-Type\": \"{}\"", v.replace('"', "\\\"")));
+        pairs.push(format!("\"WARC-Identified-Payload-Type\": \"{}\"", sanitize_header(&v)));
     }
 
     format!("{{{}}}", pairs.join(", "))
 }
 
+/// Sanitize a string for C FFI - remove null bytes and any control chars
+fn sanitize_for_ffi(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c != '\0')
+        .collect()
+}
+
 /// Parse HTTP response from WARC body
-fn parse_http_response(body: &[u8]) -> (Option<String>, Option<i32>, Option<String>, Option<String>) {
-    let content = String::from_utf8_lossy(body);
-    let mut lines = content.lines();
+/// Returns (http_version, http_status, http_headers_json, http_body_bytes)
+/// If skip_body is true, returns None for body (used for binary content)
+fn parse_http_response(body: &[u8], skip_body: bool) -> (Option<String>, Option<i32>, Option<String>, Option<Vec<u8>>) {
+    // Quick check: if body doesn't start with HTTP, return None
+    if !body.starts_with(b"HTTP/") {
+        return (None, None, None, None);
+    }
+
+    // Find the header/body separator (\r\n\r\n or \n\n)
+    let separator_pos = body
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| (p, 4))
+        .or_else(|| body.windows(2).position(|w| w == b"\n\n").map(|p| (p, 2)));
+
+    let (header_bytes, body_bytes) = match separator_pos {
+        Some((pos, sep_len)) => (&body[..pos], Some(&body[pos + sep_len..])),
+        None => {
+            // No separator found
+            return (None, None, None, None);
+        }
+    };
+
+    // Parse headers as text (headers are always ASCII-compatible)
+    let header_text = String::from_utf8_lossy(header_bytes);
+    let mut lines = header_text.lines();
 
     // Parse HTTP status line (e.g., "HTTP/1.1 200 OK")
     let (http_version, http_status) = if let Some(status_line) = lines.next() {
-        if status_line.starts_with("HTTP/") {
-            let parts: Vec<&str> = status_line.splitn(3, ' ').collect();
-            let version = parts.first().map(|s| s.to_string());
-            let status = parts.get(1).and_then(|s| s.parse::<i32>().ok());
-            (version, status)
-        } else {
-            (None, None)
-        }
+        let parts: Vec<&str> = status_line.splitn(3, ' ').collect();
+        let version = parts.first().map(|s| sanitize_for_ffi(s));
+        let status = parts.get(1).and_then(|s| s.parse::<i32>().ok());
+        (version, status)
     } else {
         (None, None)
     };
 
-    // Parse HTTP headers
+    // Parse HTTP headers (sanitize and lowercase keys for consistent access)
     let mut header_pairs = Vec::new();
-    let mut body_start = false;
-    let mut body_lines = Vec::new();
-
     for line in lines {
-        if body_start {
-            body_lines.push(line);
-        } else if line.trim().is_empty() {
-            body_start = true;
-        } else if let Some((key, value)) = line.split_once(':') {
-            let key = key.trim().replace('"', "\\\"");
-            let value = value.trim().replace('"', "\\\"");
+        if let Some((key, value)) = line.split_once(':') {
+            let key = sanitize_for_ffi(key.trim()).to_lowercase().replace('"', "\\\"");
+            let value = sanitize_for_ffi(value.trim()).replace('"', "\\\"");
             header_pairs.push(format!("\"{}\": \"{}\"", key, value));
         }
     }
@@ -106,10 +130,11 @@ fn parse_http_response(body: &[u8]) -> (Option<String>, Option<i32>, Option<Stri
         Some(format!("{{{}}}", header_pairs.join(", ")))
     };
 
-    let http_body = if body_lines.is_empty() {
+    // Return body only if not skipping and body exists
+    let http_body = if skip_body {
         None
     } else {
-        Some(body_lines.join("\n"))
+        body_bytes.map(|b| b.to_vec())
     };
 
     (http_version, http_status, http_headers, http_body)
@@ -118,23 +143,37 @@ fn parse_http_response(body: &[u8]) -> (Option<String>, Option<i32>, Option<Stri
 /// Parse a WARC record from decompressed bytes using the warc library
 fn parse_warc_record(data: &[u8]) -> Option<ParsedRecord> {
     let reader = BufReader::new(data);
-    let mut warc_reader = WarcReader::new(reader);
+    let warc_reader = WarcReader::new(reader);
 
     // Get the first record
-    let record = warc_reader.iter_records().next()?.ok()?;
+    let record = match warc_reader.iter_records().next() {
+        Some(Ok(r)) => r,
+        Some(Err(_)) => return None,
+        None => return None,
+    };
 
-    // Get WARC version from the record
-    let warc_version = record.warc_version().to_string();
+    // Get WARC version from the record (sanitize for C FFI)
+    let warc_version = sanitize_for_ffi(&record.warc_version().to_string());
 
-    // Convert headers to JSON
-    let warc_headers = headers_to_json(&record);
+    // Convert headers to JSON (sanitize for C FFI)
+    let warc_headers = sanitize_for_ffi(&headers_to_json(&record));
 
     // Check if this is a response record
     let warc_type = record.header(WarcHeader::WarcType)?;
 
     if warc_type == "response" {
         let body = record.body();
-        let (http_version, http_status, http_headers, http_body) = parse_http_response(body);
+
+        // Check if body contains null bytes (binary content)
+        // Parse HTTP headers but skip binary body
+        let is_binary = body.contains(&0u8);
+        if is_binary {
+            let uri = record.header(WarcHeader::TargetURI).unwrap_or_default();
+            let payload_type = record.header(WarcHeader::IdentifiedPayloadType).unwrap_or_default();
+            eprintln!("parse_warc: binary content, omitting body uri={} type={}", uri, payload_type);
+        }
+
+        let (http_version, http_status, http_headers, http_body) = parse_http_response(body, is_binary);
 
         Some(ParsedRecord {
             warc_version,
@@ -177,16 +216,17 @@ impl VScalar for ParseWarc {
         output: &mut dyn WritableVector,
     ) -> std::result::Result<(), Box<dyn Error>> {
         let size = input.len();
-        let input_vector = input.flat_vector(0);
-        let output_struct = output.struct_vector();
+        let _input_vector = input.flat_vector(0);
 
-        // Get child vectors for each struct field
+        let output_struct = output.struct_vector();
         let mut warc_version_vec = output_struct.child(0, size);
         let mut warc_headers_vec = output_struct.child(1, size);
         let mut http_version_vec = output_struct.child(2, size);
         let mut http_status_vec = output_struct.child(3, size);
         let mut http_headers_vec = output_struct.child(4, size);
         let mut http_body_vec = output_struct.child(5, size);
+
+        let input_vector = _input_vector;
 
         // Get input as blob slice
         let blob_slice = input_vector.as_slice_with_len::<duckdb_string_t>(size);
@@ -244,7 +284,10 @@ impl VScalar for ParseWarc {
                     }
 
                     match &record.http_body {
-                        Some(v) => http_body_vec.insert(i, v.as_str()),
+                        Some(v) => {
+                            // Use explicit &[u8] type to ensure BLOB insertion (not string)
+                            Inserter::<&[u8]>::insert(&http_body_vec, i, v.as_slice());
+                        }
                         None => http_body_vec.set_null(i),
                     }
                 }
@@ -263,15 +306,15 @@ impl VScalar for ParseWarc {
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
-        // Helper to create struct type
-        let make_struct_type = || {
+        // Helper to create struct return type (needed twice since LogicalTypeHandle doesn't impl Clone)
+        let make_return_type = || {
             LogicalTypeHandle::struct_type(&[
                 ("warc_version", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
                 ("warc_headers", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
                 ("http_version", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
                 ("http_status", LogicalTypeHandle::from(LogicalTypeId::Integer)),
                 ("http_headers", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
-                ("http_body", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
+                ("http_body", LogicalTypeHandle::from(LogicalTypeId::Blob)),
             ])
         };
 
@@ -279,11 +322,11 @@ impl VScalar for ParseWarc {
         vec![
             ScalarFunctionSignature::exact(
                 vec![LogicalTypeHandle::from(LogicalTypeId::Blob)],
-                make_struct_type(),
+                make_return_type(),
             ),
             ScalarFunctionSignature::exact(
                 vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)],
-                make_struct_type(),
+                make_return_type(),
             ),
         ]
     }
