@@ -337,3 +337,120 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
     con.register_scalar_function::<ParseWarc>("parse_warc")?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn load_example_warc() -> Vec<u8> {
+        fs::read("test-data/example.warc").expect("Failed to read test-data/example.warc")
+    }
+
+    #[test]
+    fn test_parse_warc_record_basic() {
+        let data = load_example_warc();
+        let result = parse_warc_record(&data);
+        assert!(result.is_some());
+
+        let record = result.unwrap();
+        assert_eq!(record.warc_version, "1.0");
+        assert_eq!(record.http_status, Some(200));
+        assert_eq!(record.http_version, Some("HTTP/1.1".to_string()));
+        assert!(record.http_body.is_some());
+        let body = String::from_utf8_lossy(record.http_body.as_ref().unwrap());
+        assert!(body.contains("Example Domain"));
+    }
+
+    #[test]
+    fn test_parse_warc_headers_json() {
+        let data = load_example_warc();
+        let result = parse_warc_record(&data).unwrap();
+
+        // Check WARC headers contain expected fields
+        assert!(result.warc_headers.contains("\"WARC-Type\": \"response\""));
+        assert!(result.warc_headers.contains("\"WARC-Target-URI\": \"http://www.example.com/\""));
+        assert!(result.warc_headers.contains("\"WARC-IP-Address\": \"2.18.67.69\""));
+    }
+
+    #[test]
+    fn test_parse_http_headers_lowercase() {
+        let data = load_example_warc();
+        let result = parse_warc_record(&data).unwrap();
+        let http_headers = result.http_headers.unwrap();
+
+        // HTTP header keys should be lowercase
+        assert!(http_headers.contains("\"content-type\": \"text/html\""));
+        assert!(http_headers.contains("\"content-length\": \"513\""));
+    }
+
+    #[test]
+    fn test_parse_http_response_basic() {
+        let http_data = b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nNot found";
+        let (version, status, headers, body) = parse_http_response(http_data, false);
+
+        assert_eq!(version, Some("HTTP/1.1".to_string()));
+        assert_eq!(status, Some(404));
+        assert!(headers.unwrap().contains("\"content-type\": \"text/plain\""));
+        assert_eq!(body, Some(b"Not found".to_vec()));
+    }
+
+    #[test]
+    fn test_parse_http_response_skip_body() {
+        let http_data = b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\r\n\x89PNG\r\n\x1a\n";
+        let (version, status, headers, body) = parse_http_response(http_data, true);
+
+        assert_eq!(version, Some("HTTP/1.1".to_string()));
+        assert_eq!(status, Some(200));
+        assert!(headers.is_some());
+        assert!(body.is_none()); // Body skipped
+    }
+
+    #[test]
+    fn test_parse_http_response_not_http() {
+        let data = b"Not HTTP data";
+        let (version, status, headers, body) = parse_http_response(data, false);
+
+        assert!(version.is_none());
+        assert!(status.is_none());
+        assert!(headers.is_none());
+        assert!(body.is_none());
+    }
+
+    #[test]
+    fn test_sanitize_for_ffi_removes_nulls() {
+        let input = "hello\0world";
+        let result = sanitize_for_ffi(input);
+        assert_eq!(result, "helloworld");
+    }
+
+    #[test]
+    fn test_parse_warc_invalid_data() {
+        let invalid = b"This is not a WARC file";
+        let result = parse_warc_record(invalid);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_gzip_decompression() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let data = load_example_warc();
+
+        // Compress the data
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&data).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // Decompress and parse
+        let mut decoder = GzDecoder::new(compressed.as_slice());
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).unwrap();
+
+        let result = parse_warc_record(&decompressed);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().http_status, Some(200));
+    }
+}
