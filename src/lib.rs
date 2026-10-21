@@ -4,7 +4,6 @@ extern crate libduckdb_sys;
 
 use duckdb::{
     core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
-    ffi,
     types::DuckString,
     vscalar::{ScalarFunctionSignature, VScalar},
     vtab::arrow::WritableVector,
@@ -20,7 +19,7 @@ use warc::{WarcHeader, WarcReader};
 /// Parsed WARC record with all required fields
 struct ParsedRecord {
     warc_version: String,
-    warc_headers: String,   // JSON map
+    warc_headers: String, // JSON map
     http_version: Option<String>,
     http_status: Option<i32>,
     http_headers: Option<String>, // JSON map
@@ -28,7 +27,7 @@ struct ParsedRecord {
 }
 
 /// Sanitize header value for JSON output (escape quotes, remove null bytes)
-fn sanitize_header(v: &std::borrow::Cow<str>) -> String {
+fn sanitize_header(v: &str) -> String {
     v.replace('"', "\\\"").replace('\0', "")
 }
 
@@ -57,13 +56,22 @@ fn headers_to_json(record: &warc::Record<warc::BufferedBody>) -> String {
     }
     pairs.push(format!("\"Content-Length\": {}", record.content_length()));
     if let Some(v) = record.header(WarcHeader::PayloadDigest) {
-        pairs.push(format!("\"WARC-Payload-Digest\": \"{}\"", sanitize_header(&v)));
+        pairs.push(format!(
+            "\"WARC-Payload-Digest\": \"{}\"",
+            sanitize_header(&v)
+        ));
     }
     if let Some(v) = record.header(WarcHeader::BlockDigest) {
-        pairs.push(format!("\"WARC-Block-Digest\": \"{}\"", sanitize_header(&v)));
+        pairs.push(format!(
+            "\"WARC-Block-Digest\": \"{}\"",
+            sanitize_header(&v)
+        ));
     }
     if let Some(v) = record.header(WarcHeader::IdentifiedPayloadType) {
-        pairs.push(format!("\"WARC-Identified-Payload-Type\": \"{}\"", sanitize_header(&v)));
+        pairs.push(format!(
+            "\"WARC-Identified-Payload-Type\": \"{}\"",
+            sanitize_header(&v)
+        ));
     }
 
     format!("{{{}}}", pairs.join(", "))
@@ -71,14 +79,14 @@ fn headers_to_json(record: &warc::Record<warc::BufferedBody>) -> String {
 
 /// Sanitize a string for C FFI - remove null bytes and any control chars
 fn sanitize_for_ffi(s: &str) -> String {
-    s.chars()
-        .filter(|c| *c != '\0')
-        .collect()
+    s.chars().filter(|c| *c != '\0').collect()
 }
 
 /// Parse HTTP response from WARC body
 /// Returns (http_version, http_status, http_headers_json, http_body_bytes)
-fn parse_http_response(body: &[u8]) -> (Option<String>, Option<i32>, Option<String>, Option<Vec<u8>>) {
+fn parse_http_response(
+    body: &[u8],
+) -> (Option<String>, Option<i32>, Option<String>, Option<Vec<u8>>) {
     // Quick check: if body doesn't start with HTTP, return None
     if !body.starts_with(b"HTTP/") {
         return (None, None, None, None);
@@ -117,7 +125,9 @@ fn parse_http_response(body: &[u8]) -> (Option<String>, Option<i32>, Option<Stri
     let mut header_pairs = Vec::new();
     for line in lines {
         if let Some((key, value)) = line.split_once(':') {
-            let key = sanitize_for_ffi(key.trim()).to_lowercase().replace('"', "\\\"");
+            let key = sanitize_for_ffi(key.trim())
+                .to_lowercase()
+                .replace('"', "\\\"");
             let value = sanitize_for_ffi(value.trim()).replace('"', "\\\"");
             header_pairs.push(format!("\"{}\": \"{}\"", key, value));
         }
@@ -148,7 +158,7 @@ fn parse_warc_record(data: &[u8]) -> Option<ParsedRecord> {
     };
 
     // Get WARC version from the record (sanitize for C FFI)
-    let warc_version = sanitize_for_ffi(&record.warc_version().to_string());
+    let warc_version = sanitize_for_ffi(record.warc_version());
 
     // Convert headers to JSON (sanitize for C FFI)
     let warc_headers = sanitize_for_ffi(&headers_to_json(&record));
@@ -195,7 +205,7 @@ struct ParseWarc;
 impl VScalar for ParseWarc {
     type State = ();
 
-    unsafe fn invoke(
+    fn invoke(
         _state: &Self::State,
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
@@ -214,7 +224,7 @@ impl VScalar for ParseWarc {
         let input_vector = _input_vector;
 
         // Get input as blob slice
-        let blob_slice = input_vector.as_slice_with_len::<duckdb_string_t>(size);
+        let blob_slice = unsafe { input_vector.as_slice_with_len::<duckdb_string_t>(size) };
 
         for i in 0..size {
             if input_vector.row_is_null(i as u64) {
@@ -257,7 +267,7 @@ impl VScalar for ParseWarc {
 
                     match record.http_status {
                         Some(v) => {
-                            let slice = http_status_vec.as_mut_slice::<i32>();
+                            let slice = unsafe { http_status_vec.as_mut_slice::<i32>() };
                             slice[i] = v;
                         }
                         None => http_status_vec.set_null(i),
@@ -294,11 +304,26 @@ impl VScalar for ParseWarc {
         // Helper to create struct return type (needed twice since LogicalTypeHandle doesn't impl Clone)
         let make_return_type = || {
             LogicalTypeHandle::struct_type(&[
-                ("warc_version", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
-                ("warc_headers", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
-                ("http_version", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
-                ("http_status", LogicalTypeHandle::from(LogicalTypeId::Integer)),
-                ("http_headers", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
+                (
+                    "warc_version",
+                    LogicalTypeHandle::from(LogicalTypeId::Varchar),
+                ),
+                (
+                    "warc_headers",
+                    LogicalTypeHandle::from(LogicalTypeId::Varchar),
+                ),
+                (
+                    "http_version",
+                    LogicalTypeHandle::from(LogicalTypeId::Varchar),
+                ),
+                (
+                    "http_status",
+                    LogicalTypeHandle::from(LogicalTypeId::Integer),
+                ),
+                (
+                    "http_headers",
+                    LogicalTypeHandle::from(LogicalTypeId::Varchar),
+                ),
                 ("http_body", LogicalTypeHandle::from(LogicalTypeId::Blob)),
             ])
         };
@@ -354,8 +379,12 @@ mod tests {
 
         // Check WARC headers contain expected fields
         assert!(result.warc_headers.contains("\"WARC-Type\": \"response\""));
-        assert!(result.warc_headers.contains("\"WARC-Target-URI\": \"http://www.example.com/\""));
-        assert!(result.warc_headers.contains("\"WARC-IP-Address\": \"2.18.67.69\""));
+        assert!(result
+            .warc_headers
+            .contains("\"WARC-Target-URI\": \"http://www.example.com/\""));
+        assert!(result
+            .warc_headers
+            .contains("\"WARC-IP-Address\": \"2.18.67.69\""));
     }
 
     #[test]
@@ -376,7 +405,9 @@ mod tests {
 
         assert_eq!(version, Some("HTTP/1.1".to_string()));
         assert_eq!(status, Some(404));
-        assert!(headers.unwrap().contains("\"content-type\": \"text/plain\""));
+        assert!(headers
+            .unwrap()
+            .contains("\"content-type\": \"text/plain\""));
         assert_eq!(body, Some(b"Not found".to_vec()));
     }
 
@@ -396,12 +427,15 @@ mod tests {
     #[test]
     fn test_parse_http_response_pdf() {
         // PDF content should be preserved in BLOB
-        let http_data = b"HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\n\r\n%PDF-1.4\n%\xe2\xe3\xcf\xd3";
+        let http_data =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\n\r\n%PDF-1.4\n%\xe2\xe3\xcf\xd3";
         let (version, status, headers, body) = parse_http_response(http_data);
 
         assert_eq!(version, Some("HTTP/1.1".to_string()));
         assert_eq!(status, Some(200));
-        assert!(headers.unwrap().contains("\"content-type\": \"application/pdf\""));
+        assert!(headers
+            .unwrap()
+            .contains("\"content-type\": \"application/pdf\""));
         // PDF body preserved with binary data
         assert!(body.is_some());
         assert!(body.unwrap().starts_with(b"%PDF-1.4"));
