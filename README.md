@@ -123,7 +123,7 @@ parse_warc(BLOB) -> STRUCT(
 - Built with Rust using the `warc` crate (v0.4.0)
 - Uses `flate2` for gzip decompression
 - Auto-detects compressed vs uncompressed input
-- Compatible with DuckDB v1.4.2
+- Uses the stable DuckDB C API (v1.5.6), compatible with DuckDB v2.0
 
 ## License
 
