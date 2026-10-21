@@ -12,7 +12,7 @@ USE_UNSTABLE_C_API=0
 TARGET_DUCKDB_VERSION=v1.5.6
 
 # DuckDB version used by the python test runner
-DUCKDB_TEST_VERSION=2.0.0
+DUCKDB_TEST_VERSION?=2.0.0
 
 all: configure debug
 
