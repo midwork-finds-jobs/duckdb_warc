@@ -4,12 +4,15 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 EXTENSION_NAME=warc
 
-# Set to 1 to enable Unstable API (binaries will only work on TARGET_DUCKDB_VERSION, forwards compatibility will be broken)
-# Note: currently extension-template-rs requires this, as duckdb-rs relies on unstable C API functionality
-USE_UNSTABLE_C_API=1
+# Stable V1 C API (C_STRUCT): loads on DuckDB >= TARGET_DUCKDB_VERSION incl. v2.0.x.
+# Unstable API would require the v2 entrypoint (_init_c_api_v2), which duckdb-rs classic API does not emit.
+USE_UNSTABLE_C_API=0
 
-# Target DuckDB version
-TARGET_DUCKDB_VERSION=v1.4.2
+# Target DuckDB V1 C API version
+TARGET_DUCKDB_VERSION=v1.5.6
+
+# DuckDB version used by the python test runner
+DUCKDB_TEST_VERSION?=2.0.0
 
 all: configure debug
 
@@ -28,3 +31,11 @@ test_release: test_extension_release
 
 clean: clean_build clean_rust
 clean_all: clean_configure clean
+
+# Code quality checks (called by extension-ci-tools _extension_code_quality.yml)
+.PHONY: format-check tidy-check
+format-check:
+	cargo fmt --all -- --check
+
+tidy-check:
+	cargo clippy --all-targets $(CARGO_FEATURES) -- -D warnings

@@ -1,0 +1,15 @@
+# name: test/sql/warc.test
+# description: parse_warc smoke test
+# group: [warc]
+
+require warc
+
+query ITI
+SELECT (parse_warc(content)).warc_version, (parse_warc(content)).http_status, octet_length((parse_warc(content)).http_body) FROM read_blob('test-data/example.warc');
+----
+1.0	200	513
+
+query TT
+SELECT json_extract_string((parse_warc(content)).warc_headers, '$."WARC-Type"'), json_extract_string((parse_warc(content)).http_headers, '$."content-type"') FROM read_blob('test-data/example.warc');
+----
+response	text/html
