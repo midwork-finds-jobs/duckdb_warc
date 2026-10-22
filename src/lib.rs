@@ -12,6 +12,7 @@ use duckdb::{
 use duckdb_loadable_macros::duckdb_entrypoint_c_api;
 use flate2::read::GzDecoder;
 use libduckdb_sys::duckdb_string_t;
+use serde_json::{Map, Value};
 use std::error::Error;
 use std::io::{BufReader, Read};
 use warc::{WarcHeader, WarcReader};
@@ -26,55 +27,34 @@ struct ParsedRecord {
     http_body: Option<Vec<u8>>,   // Binary body data
 }
 
-/// Sanitize header value for JSON output (escape quotes, remove null bytes)
-fn sanitize_header(v: &str) -> String {
-    v.replace('"', "\\\"").replace('\0', "")
-}
-
-/// Convert WARC headers to a JSON-like map string
+/// Convert WARC headers to a JSON object string
 fn headers_to_json(record: &warc::Record<warc::BufferedBody>) -> String {
-    let mut pairs = Vec::new();
+    let mut map = Map::new();
+    let add = |map: &mut Map<String, Value>, key: &str, header: WarcHeader| {
+        if let Some(v) = record.header(header) {
+            map.insert(key.to_string(), Value::String(v.into_owned()));
+        }
+    };
 
-    // Get standard headers
-    if let Some(v) = record.header(WarcHeader::WarcType) {
-        pairs.push(format!("\"WARC-Type\": \"{}\"", sanitize_header(&v)));
-    }
-    if let Some(v) = record.header(WarcHeader::Date) {
-        pairs.push(format!("\"WARC-Date\": \"{}\"", sanitize_header(&v)));
-    }
-    if let Some(v) = record.header(WarcHeader::RecordID) {
-        pairs.push(format!("\"WARC-Record-ID\": \"{}\"", sanitize_header(&v)));
-    }
-    if let Some(v) = record.header(WarcHeader::TargetURI) {
-        pairs.push(format!("\"WARC-Target-URI\": \"{}\"", sanitize_header(&v)));
-    }
-    if let Some(v) = record.header(WarcHeader::IPAddress) {
-        pairs.push(format!("\"WARC-IP-Address\": \"{}\"", sanitize_header(&v)));
-    }
-    if let Some(v) = record.header(WarcHeader::ContentType) {
-        pairs.push(format!("\"Content-Type\": \"{}\"", sanitize_header(&v)));
-    }
-    pairs.push(format!("\"Content-Length\": {}", record.content_length()));
-    if let Some(v) = record.header(WarcHeader::PayloadDigest) {
-        pairs.push(format!(
-            "\"WARC-Payload-Digest\": \"{}\"",
-            sanitize_header(&v)
-        ));
-    }
-    if let Some(v) = record.header(WarcHeader::BlockDigest) {
-        pairs.push(format!(
-            "\"WARC-Block-Digest\": \"{}\"",
-            sanitize_header(&v)
-        ));
-    }
-    if let Some(v) = record.header(WarcHeader::IdentifiedPayloadType) {
-        pairs.push(format!(
-            "\"WARC-Identified-Payload-Type\": \"{}\"",
-            sanitize_header(&v)
-        ));
-    }
+    add(&mut map, "WARC-Type", WarcHeader::WarcType);
+    add(&mut map, "WARC-Date", WarcHeader::Date);
+    add(&mut map, "WARC-Record-ID", WarcHeader::RecordID);
+    add(&mut map, "WARC-Target-URI", WarcHeader::TargetURI);
+    add(&mut map, "WARC-IP-Address", WarcHeader::IPAddress);
+    add(&mut map, "Content-Type", WarcHeader::ContentType);
+    map.insert(
+        "Content-Length".to_string(),
+        Value::from(record.content_length()),
+    );
+    add(&mut map, "WARC-Payload-Digest", WarcHeader::PayloadDigest);
+    add(&mut map, "WARC-Block-Digest", WarcHeader::BlockDigest);
+    add(
+        &mut map,
+        "WARC-Identified-Payload-Type",
+        WarcHeader::IdentifiedPayloadType,
+    );
 
-    format!("{{{}}}", pairs.join(", "))
+    Value::Object(map).to_string()
 }
 
 /// Sanitize a string for C FFI - remove null bytes and any control chars
@@ -122,21 +102,20 @@ fn parse_http_response(
     };
 
     // Parse HTTP headers (sanitize and lowercase keys for consistent access)
-    let mut header_pairs = Vec::new();
+    let mut header_map = Map::new();
     for line in lines {
         if let Some((key, value)) = line.split_once(':') {
-            let key = sanitize_for_ffi(key.trim())
-                .to_lowercase()
-                .replace('"', "\\\"");
-            let value = sanitize_for_ffi(value.trim()).replace('"', "\\\"");
-            header_pairs.push(format!("\"{}\": \"{}\"", key, value));
+            header_map.insert(
+                key.trim().to_lowercase(),
+                Value::String(value.trim().to_string()),
+            );
         }
     }
 
-    let http_headers = if header_pairs.is_empty() {
+    let http_headers = if header_map.is_empty() {
         None
     } else {
-        Some(format!("{{{}}}", header_pairs.join(", ")))
+        Some(Value::Object(header_map).to_string())
     };
 
     // Always return body as BLOB (handles binary content like PDFs)
@@ -378,13 +357,13 @@ mod tests {
         let result = parse_warc_record(&data).unwrap();
 
         // Check WARC headers contain expected fields
-        assert!(result.warc_headers.contains("\"WARC-Type\": \"response\""));
+        assert!(result.warc_headers.contains("\"WARC-Type\":\"response\""));
         assert!(result
             .warc_headers
-            .contains("\"WARC-Target-URI\": \"http://www.example.com/\""));
+            .contains("\"WARC-Target-URI\":\"http://www.example.com/\""));
         assert!(result
             .warc_headers
-            .contains("\"WARC-IP-Address\": \"2.18.67.69\""));
+            .contains("\"WARC-IP-Address\":\"2.18.67.69\""));
     }
 
     #[test]
@@ -394,8 +373,8 @@ mod tests {
         let http_headers = result.http_headers.unwrap();
 
         // HTTP header keys should be lowercase
-        assert!(http_headers.contains("\"content-type\": \"text/html\""));
-        assert!(http_headers.contains("\"content-length\": \"513\""));
+        assert!(http_headers.contains("\"content-type\":\"text/html\""));
+        assert!(http_headers.contains("\"content-length\":\"513\""));
     }
 
     #[test]
@@ -405,9 +384,7 @@ mod tests {
 
         assert_eq!(version, Some("HTTP/1.1".to_string()));
         assert_eq!(status, Some(404));
-        assert!(headers
-            .unwrap()
-            .contains("\"content-type\": \"text/plain\""));
+        assert!(headers.unwrap().contains("\"content-type\":\"text/plain\""));
         assert_eq!(body, Some(b"Not found".to_vec()));
     }
 
@@ -435,7 +412,7 @@ mod tests {
         assert_eq!(status, Some(200));
         assert!(headers
             .unwrap()
-            .contains("\"content-type\": \"application/pdf\""));
+            .contains("\"content-type\":\"application/pdf\""));
         // PDF body preserved with binary data
         assert!(body.is_some());
         assert!(body.unwrap().starts_with(b"%PDF-1.4"));
@@ -450,6 +427,31 @@ mod tests {
         assert!(status.is_none());
         assert!(headers.is_none());
         assert!(body.is_none());
+    }
+
+    #[test]
+    fn test_http_headers_json_escaping() {
+        let http_data =
+            b"HTTP/1.1 200 OK\r\nX-Quote: a\"b\r\nX-Backslash: c:\\dir\\\r\nX-Tab: d\te\r\n\r\nbody";
+        let (_, _, headers, _) = parse_http_response(http_data);
+        let parsed: Value = serde_json::from_str(&headers.unwrap()).unwrap();
+        assert_eq!(parsed["x-quote"], "a\"b");
+        assert_eq!(parsed["x-backslash"], "c:\\dir\\");
+        assert_eq!(parsed["x-tab"], "d\te");
+    }
+
+    #[test]
+    fn test_warc_headers_json_escaping() {
+        let uri = "http://example.com/a\"b\\c\td\ne";
+        let mut record = warc::Record::<warc::BufferedBody>::default();
+        record.set_warc_type(warc::RecordType::Response);
+        record
+            .set_header(WarcHeader::TargetURI, uri)
+            .expect("set header");
+        let json = headers_to_json(&record);
+        let parsed: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["WARC-Target-URI"], uri);
+        assert_eq!(parsed["WARC-Type"], "response");
     }
 
     #[test]

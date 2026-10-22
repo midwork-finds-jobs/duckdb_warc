@@ -21,3 +21,4 @@ duckdb-loadable-macros = "1.10506.1"
 libduckdb-sys = { version = "1.10506.1", features = ["loadable-extension"] }
 flate2 = "1.0"
 warc = "0.4.0"
+serde_json = { version = "1", features = ["preserve_order"] }
